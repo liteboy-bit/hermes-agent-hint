@@ -83,13 +83,25 @@ def agent_type():
     return str(_get("agent_type") or "hermes")
 
 
+def _fold_priority_level(level):
+    """把任意配置值折叠进二值域 {1, 3}。
+
+    消费侧只拿 ``priority.level`` 与一条准入线比较，多于两档的取值没有对应语义，
+    多出来的档位只会让调用方以为存在它们又拿不到的区分。语义丰富度由 ``reason`` 承担。
+
+    ``level >= 3`` 是"有人正在等"的交互档，其余一律背景档；v1 遗留的 2/4 折叠后
+    落在它们原本就在的那一侧（2 → 1、4 → 3），越界值同理。
+    """
+    return 3 if level >= 3 else 1
+
+
 def priority():
     """priority 段；level<=0 或空 -> None（整段省略）。"""
     level = _int(_get("priority_level"), 0)
     if level <= 0:
         return None
     reason = str(_get("priority_reason") or "").strip() or "user_waiting"
-    return {"level": level, "reason": reason}
+    return {"level": _fold_priority_level(level), "reason": reason}
 
 
 def status_sink():

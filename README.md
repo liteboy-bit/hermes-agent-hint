@@ -80,7 +80,7 @@ Every key is optional — the defaults are the safe defaults.
 |---|---|---|
 | `enabled` | `false` | Master switch. Off = no header, no events. |
 | `agent_type` | `hermes` | Value written to `session.agent_type`. Set per deployment/role. |
-| `priority_level` | `3` | `priority.level`; `<= 0` omits the whole `priority` block. |
+| `priority_level` | `3` | `priority.level`, folded to the two-level contract: `>= 3` becomes `3` (a person is waiting), anything else becomes `1`. `<= 0` omits the whole `priority` block. |
 | `priority_reason` | `user_waiting` | `priority.reason` text. |
 | `status_sink` | `none` | Event transport: `ndjson`, `http`, or `none`. |
 | `status_url` | *(empty)* | Target URL for the `http` sink. Empty = no network traffic at all. |
@@ -247,7 +247,7 @@ hermes plugins enable agent-hint
 |---|---|---|
 | `enabled` | `false` | 总开关。关闭 = 不发 header、不发事件。 |
 | `agent_type` | `hermes` | 写入 `session.agent_type` 的值，按部署/角色自定。 |
-| `priority_level` | `3` | `priority.level`；`<= 0` 则整个 `priority` 段不发射。 |
+| `priority_level` | `3` | `priority.level`，折叠进二值域：`>= 3` 记为 `3`（有人正在等），其余记为 `1`。`<= 0` 则整个 `priority` 段不发射。 |
 | `priority_reason` | `user_waiting` | `priority.reason` 文本。 |
 | `status_sink` | `none` | 事件通道：`ndjson`、`http`、`none`。 |
 | `status_url` | *(空)* | `http` 通道的目标地址。留空 = 完全不产生网络流量。 |

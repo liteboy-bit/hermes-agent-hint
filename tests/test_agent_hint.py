@@ -500,3 +500,17 @@ def test_epoch_counter_and_provider_seam(ah_plugin):
     s.set_epoch_provider(None)                    # 恢复内部计数器
     assert s.note_call("s1", "r5")[3] == 1
     assert s.bump_epoch("s-nonexistent") == 0     # 未知会话安全返回 0
+
+
+def test_priority_folds_onto_the_two_level_contract(ah_plugin, monkeypatch):
+    """priority.level 只保留 {1, 3}：消费侧只跟一条准入线比较。
+
+    v1 遗留的 2/4 折叠后仍落在原来那一侧（2 → 1、4 → 3），越界值同理；
+    reason 原样保留，用来承载真正丰富的语义。
+    """
+    s = ah_plugin._settings
+    for configured, expected in (("1", 1), ("2", 1), ("3", 3), ("4", 3), ("90", 3), ("7", 3)):
+        monkeypatch.setenv("AGENT_HINT_PRIORITY_LEVEL", configured)
+        monkeypatch.setenv("AGENT_HINT_PRIORITY_REASON", "critical_path")
+        s._reset()
+        assert s.priority() == {"level": expected, "reason": "critical_path"}, configured
