@@ -396,7 +396,8 @@ def test_middleware_injects_header_cow(ah_plugin, monkeypatch):
     # 默认 auto：没有可用的运行时信号时按协议默认 gap（300s * 2）声明保留窗口；
     # pin 已退役，只发一条 ephemeral。
     assert hint["cache_control"] == [
-        {"type": "ephemeral", "ttl_s": 600, "range": {"end": 1, "unit": "message"}},
+        # 断点默认 auto：落在当前逻辑输入末尾（system + user = 2），不再只护 system 那条
+        {"type": "ephemeral", "ttl_s": 600, "range": {"end": 2, "unit": "message"}},
     ]
 
 
@@ -514,3 +515,52 @@ def test_priority_folds_onto_the_two_level_contract(ah_plugin, monkeypatch):
         monkeypatch.setenv("AGENT_HINT_PRIORITY_REASON", "critical_path")
         s._reset()
         assert s.priority() == {"level": expected, "reason": "critical_path"}, configured
+
+def test_cache_pin_end_defaults_to_the_end_of_the_logical_input(ah_plugin, monkeypatch):
+    """断点默认落在当前逻辑输入末尾，不再只护住 system 那一条。"""
+    s = ah_plugin._settings
+    monkeypatch.delenv("AGENT_HINT_CACHE_PIN_END", raising=False)
+    s._reset()
+    assert s.cache_pin_end() is None  # None = auto
+
+    monkeypatch.setenv("AGENT_HINT_CACHE_PIN_END", "auto")
+    s._reset()
+    assert s.cache_pin_end() is None
+
+    monkeypatch.setenv("AGENT_HINT_CACHE_PIN_END", "0")
+    s._reset()
+    assert s.cache_pin_end() == 0
+
+    monkeypatch.setenv("AGENT_HINT_CACHE_PIN_END", "3")
+    s._reset()
+    assert s.cache_pin_end() == 3
+
+
+def test_emitted_breakpoint_covers_the_whole_input(ah_plugin, monkeypatch):
+    """发出去的 range.end 等于消息条数（含 system），与 Pi 一致。"""
+    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
+    monkeypatch.delenv("AGENT_HINT_CACHE_PIN_END", raising=False)
+    monkeypatch.delenv("AGENT_HINT_CACHE_TASK_END", raising=False)
+    ah_plugin._settings._reset()
+
+    hooks, mw = {}, {}
+
+    class _C:
+        def register_hook(self, name, cb):
+            hooks[name] = cb
+
+        def register_middleware(self, name, cb):
+            mw[name] = cb
+
+    ah_plugin.register(_C())
+    req = {"model": "m", "messages": [
+        {"role": "system", "content": "sys " + "x " * 400},
+        {"role": "user", "content": "hello " + "y " * 200},
+        {"role": "assistant", "content": "hi"},
+    ]}
+    out = mw["llm_request"](request=req, session_id="s-end", api_request_id="r-1")
+    raw = (out.get("request") or {}).get("extra_headers", {}).get("X-Agent-Hint")
+    import base64 as _b64
+    import json as _json
+    hint = _json.loads(_b64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode())
+    assert hint["cache_control"][0]["range"]["end"] == 3

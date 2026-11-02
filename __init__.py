@@ -187,7 +187,9 @@ def _on_llm_request(**kw):
             priority=_settings.priority(),
             cache_control=_builder.cache_control(
                 req,
-                end=_settings.cache_pin_end(),
+                # None = auto：断点落在当前逻辑输入末尾（与 Pi 一致）。显式配置仍然生效。
+                end=_settings.cache_pin_end() if _settings.cache_pin_end() is not None
+                else len(req.get("messages") or []),
                 ttl_s=ttl_s or 0,
                 task_end=_settings.cache_task_end() or None,
             ),

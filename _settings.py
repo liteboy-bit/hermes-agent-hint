@@ -17,7 +17,7 @@ _DEFAULTS = {
     "status_url": "",
     "finalize_on": "session_end",
     "suspend_after_s": "0",
-    "cache_pin_end": "1",
+    "cache_pin_end": "auto",
     "cache_ttl_s": "auto",
     "cache_task_end": "0",
     "next_action_map": "",
@@ -125,7 +125,16 @@ def suspend_after_s():
 
 
 def cache_pin_end():
-    return max(0, _int(_get("cache_pin_end"), 1))
+    """断点位置：``auto``（默认）= 当前逻辑输入末尾，``0`` = 不发，正整数 = 显式下标。
+
+    历史默认是 1（只护住 system 那一条）。``pin`` 退役后这个默认已经错位：单条声明
+    保护的是"当前前缀"，而 system 之外的部分同样是下一轮的前缀。改成 ``auto`` 后
+    与 Pi 一致，断点落在整段逻辑输入末尾；显式配置仍然生效，便于定位问题。
+    """
+    raw = str(_get("cache_pin_end") if _get("cache_pin_end") is not None else "auto").strip().lower()
+    if raw in ("", "auto"):
+        return None
+    return max(0, _int(raw, 0))
 
 
 def cache_ttl_s():

@@ -86,7 +86,7 @@ Every key is optional — the defaults are the safe defaults.
 | `status_url` | *(empty)* | Target URL for the `http` sink. Empty = no network traffic at all. |
 | `finalize_on` | `session_end` | When to emit `finalize`: `session_end` or `session_finalize`. |
 | `suspend_after_s` | `0` | Emit `suspend` if an approval stays pending this long. `0` disables. |
-| `cache_pin_end` | `1` | Breakpoint position (`range.end`) of the single `ephemeral` entry; `0` omits the range. Historical name, kept for config compatibility. |
+| `cache_pin_end` | `auto` | Breakpoint position (`range.end`) of the single `ephemeral` entry. `auto` (default) = the end of the current logical input, system prompt included; `0` emits no declaration; an integer pins an explicit position. Historical name, kept for config compatibility. |
 | `cache_ttl_s` | `auto` | Retention seconds for the ephemeral range. `auto` derives it from the observed gap (next tool budget, else the inter-call interval, else 300 s, doubled and clamped to 60–3600); `0` sends no declaration at all; a number fixes it. |
 | `cache_task_end` | `0` | Message index of the task-description end. When wider than `cache_pin_end` it becomes the position of the **single** breakpoint; the declaration itself stays one entry. `0` uses `cache_pin_end`. |
 | `next_action_map` | *(empty)* | Generic `prediction.next_action` heuristic (JSON). Empty = omit. |
@@ -253,7 +253,7 @@ hermes plugins enable agent-hint
 | `status_url` | *(空)* | `http` 通道的目标地址。留空 = 完全不产生网络流量。 |
 | `finalize_on` | `session_end` | 何时发射 `finalize`：`session_end` 或 `session_finalize`。 |
 | `suspend_after_s` | `0` | 审批挂起超过该秒数时发射 `suspend`；`0` 关闭。 |
-| `cache_pin_end` | `1` | 单条 `ephemeral` 的断点位置（`range.end`）；`0` 则不带 range。历史命名，保留以兼容既有配置。 |
+| `cache_pin_end` | `auto` | 单条 `ephemeral` 的断点位置（`range.end`）。`auto`（默认）= 当前逻辑输入末尾（含 system）；`0` 不发声明；填整数则显式指定位置。历史命名，保留以兼容既有配置。 |
 | `cache_ttl_s` | `auto` | ephemeral 保留秒数。`auto` 按运行时信号推导（下一次工具预算 → 请求间隔 → 默认 300s，乘 2 后钳到 60–3600）；`0` 不再发送任何声明；填数字则固定。 |
 | `cache_task_end` | `0` | 任务说明末尾的消息下标。比 `cache_pin_end` 更宽时，它成为**唯一那条**断点的位置；声明本身仍只有一条。`0` 表示沿用 `cache_pin_end`。 |
 | `next_action_map` | *(空)* | 通用的 `prediction.next_action` 启发式（JSON）。留空 = 不发射。 |
