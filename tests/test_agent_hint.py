@@ -206,12 +206,23 @@ def test_state_since_ms_updates_on_change_only(ah_plugin):
     assert third >= first  # 变化则更新时间戳
 
 
-def test_finalize_then_resume(ah_plugin):
-    s = ah_plugin._state
-    s.set_state("s1", "finalize")
-    _ci, state, _since, _epoch, resumed = s.note_call("s1", "r9")
-    assert resumed is True
-    assert state == "running"
+def test_finalize_is_session_level(ah_plugin, tmp_path, monkeypatch):
+    """会话级 finalize：turn 结束（on_session_end）不发 finalize，会话关闭（on_session_finalize）才发。"""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
+    monkeypatch.setenv("AGENT_HINT_STATUS_SINK", "ndjson")
+    ah_plugin._settings._reset()
+    ah_plugin._sink._ndjson_path = None
+    ah_plugin._on_session_start(session_id="s1")
+    path = tmp_path / "agent-hint-events.ndjson"
+    assert len(path.read_text().strip().split("\n")) == 1, "only the opening running event so far"
+    ah_plugin._on_session_end(session_id="s1", completed=True)
+    assert len(path.read_text().strip().split("\n")) == 1, "a turn end must not emit finalize"
+    ah_plugin._on_session_finalize(session_id="s1")
+    lines = path.read_text().strip().split("\n")
+    assert len(lines) == 2
+    assert json.loads(lines[-1])["agent_status"]["state"] == "finalize", \
+        "only session close emits finalize, exactly once"
 
 
 def test_subagent_map_and_cleanup(ah_plugin):
@@ -408,6 +419,33 @@ def test_middleware_request_not_dict(ah_plugin, monkeypatch):
     assert ah_plugin._on_llm_request(request={}, session_id="") is None
 
 
+def test_middleware_aux_request_bare(ah_plugin, monkeypatch):
+    """辅助请求（压缩摘要 / 会话标题）整段豁免（RFC §1.3 / §3.3.5）。
+
+    宿主在中间件调用点声明：``auxiliary=1`` 或 ``purpose`` 属辅助类。插件原样
+    放行——不带 hint、不推进 call_index；被豁免的调用不占用序号。
+    """
+    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
+    ah_plugin._settings._reset()
+    req = {"model": "x", "messages": [{"role": "user", "content": "summarize"}]}
+    # auxiliary 显式声明
+    out = ah_plugin._on_llm_request(request=req, session_id="s1",
+                                    api_request_id="r1", auxiliary=True)
+    assert out is None
+    assert "extra_headers" not in req          # 入参原样，未被动过
+    # purpose 声明（大小写不敏感）
+    for purpose in ("compaction", "Summarization", "title"):
+        out = ah_plugin._on_llm_request(request=dict(req), session_id="s1",
+                                        api_request_id="r2", purpose=purpose)
+        assert out is None, purpose
+    # 非辅助 purpose 不豁免：同一条请求照常装饰，且 call_index 从 1 起
+    # （前面被豁免的三次调用没有推进序号）
+    out = ah_plugin._on_llm_request(request=dict(req), session_id="s1",
+                                    api_request_id="r3", purpose="chat")
+    hint = ah_plugin._codec.decode(out["request"]["extra_headers"]["X-Agent-Hint"])
+    assert hint["session"]["call_index"] == 1
+
+
 def test_pre_tool_call_returns_none(ah_plugin, monkeypatch):
     monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
     ah_plugin._settings._reset()
@@ -516,6 +554,31 @@ def test_priority_folds_onto_the_two_level_contract(ah_plugin, monkeypatch):
         s._reset()
         assert s.priority() == {"level": expected, "reason": "critical_path"}, configured
 
+
+def test_priority_reason_folds_onto_the_rfc_vocab(ah_plugin, monkeypatch):
+    """reason 出口必须落在 RFC 词表 {user_waiting, critical_path, background}。
+
+    词表外的取值在消费侧没有语义（拿它做准入判断只会失配）：冒号前缀命中词表的
+    取前缀（``background: context_compaction`` → ``background``），完全词表外的按
+    档位兜底——免排队档必然有人在等，背景档一律 background。
+    """
+    s = ah_plugin._settings
+    cases = [
+        ("background: context_compaction", "1", 1, "background"),
+        ("background: context_compaction", "3", 3, "background"),
+        ("continuation: tool_followup", "2", 1, "background"),
+        ("CRITICAL_PATH: retry", "3", 3, "critical_path"),
+        ("totally-custom-reason", "3", 3, "user_waiting"),
+        ("totally-custom-reason", "1", 1, "background"),
+        ("", "3", 3, "user_waiting"),
+        ("", "1", 1, "background"),
+    ]
+    for raw, level, folded, reason in cases:
+        monkeypatch.setenv("AGENT_HINT_PRIORITY_LEVEL", level)
+        monkeypatch.setenv("AGENT_HINT_PRIORITY_REASON", raw)
+        s._reset()
+        assert s.priority() == {"level": folded, "reason": reason}, (raw, level)
+
 def test_cache_pin_end_defaults_to_the_end_of_the_logical_input(ah_plugin, monkeypatch):
     """断点默认落在当前逻辑输入末尾，不再只护住 system 那一条。"""
     s = ah_plugin._settings
@@ -564,3 +627,104 @@ def test_emitted_breakpoint_covers_the_whole_input(ah_plugin, monkeypatch):
     import json as _json
     hint = _json.loads(_b64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode())
     assert hint["cache_control"][0]["range"]["end"] == 3
+
+def test_declared_fork_lineage_is_published(ah_plugin, monkeypatch):
+    """Hermes 原生只有 spawn；fork 由部署方声明。"""
+    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
+    monkeypatch.setenv("AGENT_HINT_LINEAGE",
+                       '{"relation":"fork","parent_session_id":"s-root","fork_point":7}')
+    ah_plugin._settings._reset()
+
+    lineage = ah_plugin._settings.lineage()
+    assert lineage == {"relation": "fork", "parent_session_id": "s-root", "fork_point": 7}
+
+    class _C:
+        def register_hook(self, name, cb):
+            pass
+
+        def register_middleware(self, name, cb):
+            pass
+
+    ah_plugin.register(_C())
+    parent, derivation = ah_plugin._state.lineage("s-child")
+    assert parent == "s-root"
+    assert derivation == {"relation": "fork", "fork_point": 7}
+
+
+def test_native_subagent_wins_over_declared_lineage(ah_plugin, monkeypatch):
+    """子 agent 的原生 spawn 优先于配置声明。"""
+    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
+    monkeypatch.setenv("AGENT_HINT_LINEAGE",
+                       '{"relation":"fork","parent_session_id":"s-root","fork_point":1}')
+    ah_plugin._settings._reset()
+    ah_plugin._state.subagent_start("s-parent", "s-sub", "worker")
+    parent, derivation = ah_plugin._state.lineage("s-sub")
+    assert parent == "s-parent"
+    assert derivation == {"relation": "spawn", "join": "sync"}
+
+
+def test_declared_lineage_is_ignored_when_malformed(ah_plugin, monkeypatch):
+    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
+    monkeypatch.setenv("AGENT_HINT_LINEAGE", '{"relation":"adopted"}')
+    ah_plugin._settings._reset()
+    assert ah_plugin._settings.lineage() is None
+    assert ah_plugin._state.lineage("s-root") == (None, None)
+
+def test_resume_state_is_reported_once_after_approval(ah_plugin, monkeypatch):
+    """被放行的这一条请求报 resume，之后回到 running。"""
+    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
+    ah_plugin._settings._reset()
+
+    mw = {}
+    class _C:
+        def register_hook(self, name, cb):
+            pass
+
+        def register_middleware(self, name, cb):
+            mw[name] = cb
+
+    ah_plugin.register(_C())
+    ah_plugin._on_pre_approval_request(session_id="s-res", kind="approval")
+    ah_plugin._on_post_approval_response(session_id="s-res", choice="once")
+
+    req = {"model": "m", "messages": [
+        {"role": "system", "content": "sys " + "x " * 400},
+        {"role": "user", "content": "hi"}]}
+    out = mw["llm_request"](request=req, session_id="s-res", api_request_id="r-1")
+    hint = ah_plugin._codec.decode(out["request"]["extra_headers"]["X-Agent-Hint"])
+    assert hint["agent_status"]["state"] == "resume"
+
+    out2 = mw["llm_request"](request=req, session_id="s-res", api_request_id="r-2")
+    hint2 = ah_plugin._codec.decode(out2["request"]["extra_headers"]["X-Agent-Hint"])
+    assert hint2["agent_status"]["state"] == "running"
+
+
+def test_epoch_bumps_when_the_context_shrinks(ah_plugin, monkeypatch):
+    """Hermes 没有 compaction 事件：消息条数回落即判定压缩发生，epoch +1。"""
+    monkeypatch.setenv("AGENT_HINT_ENABLED", "1")
+    ah_plugin._settings._reset()
+    mw = {}
+    class _C:
+        def register_hook(self, name, cb):
+            pass
+
+        def register_middleware(self, name, cb):
+            mw[name] = cb
+
+    ah_plugin.register(_C())
+
+    def emitted_epoch(api_id):
+        req = {"model": "m", "messages": [
+            {"role": "system", "content": "sys " + "x " * 400},
+            {"role": "user", "content": "hi"}]}
+        out = mw["llm_request"](request=req, session_id="s-epoch", api_request_id=api_id)
+        return ah_plugin._codec.decode(out["request"]["extra_headers"]["X-Agent-Hint"])["session"]["epoch"]
+
+    ah_plugin._on_pre_api_request(session_id="s-epoch", message_count=40)
+    assert emitted_epoch("r-1") == 0
+    # 条数增长：不是压缩
+    ah_plugin._on_pre_api_request(session_id="s-epoch", message_count=48)
+    assert emitted_epoch("r-2") == 0
+    # 条数回落：压缩发生
+    ah_plugin._on_pre_api_request(session_id="s-epoch", message_count=12)
+    assert emitted_epoch("r-3") == 1

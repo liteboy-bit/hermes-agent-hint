@@ -15,12 +15,14 @@ _DEFAULTS = {
     "priority_reason": "user_waiting",
     "status_sink": "",
     "status_url": "",
-    "finalize_on": "session_end",
     "suspend_after_s": "0",
     "cache_pin_end": "auto",
     "cache_ttl_s": "auto",
     "cache_task_end": "0",
     "next_action_map": "",
+    # 部署方声明的会话血缘（JSON）。Hermes 原生只有 spawn（subagent_start），
+    # fork 只能由创建该会话的一方声明。
+    "lineage": "",
 }
 
 _ctx = None
@@ -83,6 +85,10 @@ def agent_type():
     return str(_get("agent_type") or "hermes")
 
 
+# RFC §3.3.1 的 reason 词表：出口必须落在这三档内，词表外取值在消费侧没有语义。
+_RFC_REASONS = ("user_waiting", "critical_path", "background")
+
+
 def _fold_priority_level(level):
     """把任意配置值折叠进二值域 {1, 3}。
 
@@ -95,13 +101,32 @@ def _fold_priority_level(level):
     return 3 if level >= 3 else 1
 
 
+def _fold_priority_reason(reason, level):
+    """把 reason 折叠进 RFC 词表 {user_waiting, critical_path, background}。
+
+    词表外的值（宿主自造的 ``continuation: tool_followup`` 一类）不是协议语义：
+    消费方拿 reason 做准入/排障判断时只会失配。冒号前缀命中词表的取前缀
+    （``background: context_compaction`` → ``background``）；完全词表外的按档位
+    兜底——免排队档必然有人在等（``user_waiting``），背景档一律 ``background``。
+    兜底是防御性折叠，不是语义猜测：发出去的必须是消费方能读懂的词。
+    """
+    text = str(reason or "").strip()
+    if not text:
+        return "user_waiting" if level >= 3 else "background"
+    head = text.split(":", 1)[0].strip().lower()
+    if head in _RFC_REASONS:
+        return head
+    return "user_waiting" if level >= 3 else "background"
+
+
 def priority():
     """priority 段；level<=0 或空 -> None（整段省略）。"""
     level = _int(_get("priority_level"), 0)
     if level <= 0:
         return None
-    reason = str(_get("priority_reason") or "").strip() or "user_waiting"
-    return {"level": _fold_priority_level(level), "reason": reason}
+    level = _fold_priority_level(level)
+    reason = _fold_priority_reason(_get("priority_reason"), level)
+    return {"level": level, "reason": reason}
 
 
 def status_sink():
@@ -113,11 +138,6 @@ def status_sink():
 
 def status_url():
     return str(_get("status_url") or "").strip()
-
-
-def finalize_on():
-    v = str(_get("finalize_on") or "session_end").strip().lower()
-    return v if v in ("session_end", "session_finalize") else "session_end"
 
 
 def suspend_after_s():
@@ -175,3 +195,34 @@ def next_action_map():
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def lineage():
+    """部署方声明的会话血缘；未声明 -> None。
+
+    Hermes 的原生信号只有 ``subagent_start``（= spawn）。要上报 ``fork``（会话分支），
+    只能由创建该会话的一方声明：``{"relation": "fork", "parent_session_id": "...",
+    "fork_point": N}``。非法值一律忽略（宁可不报，也不报一个错的祖先）。
+    """
+    raw = str(_get("lineage") or "").strip()
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    relation = data.get("relation")
+    parent = data.get("parent_session_id")
+    if relation not in ("fork", "spawn") or not isinstance(parent, str) or not parent:
+        return None
+    line = {"relation": relation, "parent_session_id": parent}
+    if relation == "spawn":
+        join = data.get("join")
+        line["join"] = join if join in ("sync", "async") else "sync"
+    else:
+        point = data.get("fork_point")
+        if isinstance(point, int) and not isinstance(point, bool) and point >= 0:
+            line["fork_point"] = point
+    return line

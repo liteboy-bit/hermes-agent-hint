@@ -31,6 +31,8 @@ def _new():
         "inflight": set(),
         "parent_session_id": None,
         "child_role": None,
+        # 上一次请求的消息条数：条数回落即判定发生了一次上下文压缩（见 note_message_count）。
+        "last_message_count": None,
     }
 
 
@@ -72,13 +74,29 @@ def set_epoch_provider(fn):
 
 
 def bump_epoch(sid):
-    """上下文重写/压缩-fork 时递增会话 epoch（零侵入触发暂缺，留接缝，T4）。返回新 epoch。"""
+    """上下文重写/压缩-fork 时递增会话 epoch。返回新 epoch。"""
     with _lock:
         s = _sessions.get(sid)
         if s is None:
             return 0
         s["epoch"] += 1
         return s["epoch"]
+
+
+def note_message_count(sid, count):
+    """记录本次请求的消息条数；比上次少即判定发生过一次上下文压缩。
+
+    Hermes 没有 compaction 事件（上游 issue #118382），压缩后请求里的消息条数会回落，
+    这是插件侧唯一能观察到的信号。返回新 epoch；未压缩返回 None。
+    """
+    with _lock:
+        s = _touch(sid)
+        last = s.get("last_message_count")
+        s["last_message_count"] = count
+        if last is not None and count < last:
+            s["epoch"] += 1
+            return s["epoch"]
+    return None
 
 
 def _touch(sid):
@@ -98,21 +116,18 @@ def note_call(sid, api_request_id=""):
     """登记一次（可能重试的）LLM 请求。返回 (call_index, state, since_ms, epoch, resumed)。
 
     - 同 api_request_id 重复 -> call_index 不涨（重试/回退不虚增，R2）。
-    - 若当前停在 finalize（上一 turn 已结束）-> 置 running 并 resumed=True（M4）。
+    - resumed 恒为 False：finalize 是会话级终态（on_session_finalize 后会话即被
+      drop，不存在 finalize 之后再发请求的序列），旧的 M4 翻转路径已随会话级
+      语义一并删除。
     """
     with _lock:
         s = _touch(sid)
-        resumed = False
-        if s["state"] == "finalize":
-            s["state"] = "running"
-            s["state_since_ms"] = _now_ms()
-            resumed = True
         if api_request_id and api_request_id == s["last_api_request_id"]:
             pass  # 同一次逻辑调用重试，call_index 不涨
         else:
             s["call_index"] += 1
             s["last_api_request_id"] = api_request_id or ""
-        return (s["call_index"], s["state"], s["state_since_ms"], _current_epoch(sid, s), resumed)
+        return (s["call_index"], s["state"], s["state_since_ms"], _current_epoch(sid, s), False)
 
 
 def set_state(sid, state):
@@ -177,12 +192,25 @@ def agent_type(sid, default):
 
 
 def lineage(sid):
-    """返回 (parent_session_id, derivation)；根会话 -> (None, None)。"""
+    """返回 (parent_session_id, derivation)。
+
+    优先级：原生 ``subagent_start`` 记录（spawn）> 部署方声明（fork 或 spawn）> 根会话 None。
+    Hermes 没有 fork 事件，所以一条 fork 血缘只能由创建该会话的一方声明出来。
+    """
     with _lock:
         entry = _subagent.get(sid)
-        if not entry or not entry[0]:
-            return (None, None)
+    if entry and entry[0]:
         return (entry[0], {"relation": "spawn", "join": "sync"})
+    from . import _settings  # 局部导入：_settings 不依赖本模块，避免加载期循环
+    declared = _settings.lineage()
+    if declared:
+        derivation = {"relation": declared["relation"]}
+        if declared["relation"] == "spawn":
+            derivation["join"] = declared.get("join", "sync")
+        elif "fork_point" in declared:
+            derivation["fork_point"] = declared["fork_point"]
+        return (declared["parent_session_id"], derivation)
+    return (None, None)
 
 
 def subagent_start(parent_session_id, child_session_id, child_role):

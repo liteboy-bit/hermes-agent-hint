@@ -11,6 +11,7 @@ def register(ctx):
 
     for name, cb in (
         ("on_session_start", _on_session_start),
+        ("pre_api_request", _on_pre_api_request),
         ("on_session_end", _on_session_end),
         ("on_session_finalize", _on_session_finalize),
         ("pre_tool_call", _on_pre_tool_call),
@@ -60,11 +61,10 @@ def _on_session_end(**kw):
     sid = _sid(kw)
     if not sid:
         return
-    _state.clear_inflight(sid)  # turn 结束清在飞兜底
-    if _settings.finalize_on() == "session_end":
-        reason = None if kw.get("completed") else str(kw.get("turn_exit_reason") or "interrupted")
-        since = _state.set_state(sid, "finalize")
-        _sink.emit(_builder.status_event(sid, "finalize", since_ms=since, reason=reason))
+    # 会话级 finalize：turn 结束 ≠ 会话结束。这里只清在飞兜底，不发 finalize ——
+    # 消费方把 finalize 当"会话关闭、可释放会话级资源"的信号，逐 turn 发会反复
+    # 释放/重钉（Motor phase4 的会话亲和 pin）。finalize 只在 on_session_finalize 发。
+    _state.clear_inflight(sid)
 
 
 def _on_session_finalize(**kw):
@@ -73,9 +73,9 @@ def _on_session_finalize(**kw):
     sid = _sid(kw)
     if not sid:
         return
-    if _settings.finalize_on() == "session_finalize":
-        since = _state.set_state(sid, "finalize")
-        _sink.emit(_builder.status_event(sid, "finalize", since_ms=since))
+    # 会话真关闭：finalize 是会话级终态，一个会话至多一次，且必须是它的最后一条事件。
+    since = _state.set_state(sid, "finalize")
+    _sink.emit(_builder.status_event(sid, "finalize", since_ms=since))
     _state.drop(sid)  # 会话真关闭回收（接缝）
 
 
@@ -125,8 +125,23 @@ def _on_post_approval_response(**kw):
     if not sid:
         return
     _state.cancel_suspend_watchdog(sid)
-    since = _state.set_state(sid, "running")
-    _sink.emit(_builder.status_event(sid, "running", since_ms=since))
+    # `resume` 是状态不是事件：被放行的这一条请求报 resume，之后回到 running。
+    since = _state.set_state(sid, "resume")
+    _sink.emit(_builder.status_event(sid, "resume", since_ms=since, reason="human_approval"))
+
+
+def _on_pre_api_request(**kw):
+    """观测上下文压缩：Hermes 没有 compaction 事件（issue #118382），
+    只能从请求的消息条数回落判断——同一会话里条数显著减少即压缩发生过一次。
+    """
+    if not _on():
+        return
+    sid = _sid(kw)
+    if not sid:
+        return
+    count = kw.get("message_count")
+    if isinstance(count, int) and count >= 0:
+        _state.note_message_count(sid, count)
 
 
 def _on_subagent_start(**kw):
@@ -153,11 +168,30 @@ def _on_post_api_request(**kw):
 
 # --- middleware ---
 
+_AUX_PURPOSES = ("compaction", "summarization", "summary", "title")
+
+
+def _is_aux_request(kw):
+    """辅助请求判定（RFC §1.3 / §3.3.5）：压缩摘要、会话标题这类请求不带任何 hint。
+
+    Hermes 宿主没有独立的 compaction 事件（issue #118382），所以辅助性只能由
+    中间件调用点显式声明：``auxiliary=1``，或 ``purpose`` 属辅助类。声明责任在
+    宿主/适配器一侧，插件不做消息条数猜测——猜错的代价（主请求裸奔）远大于
+    漏判（辅助请求多带一个头）。
+    """
+    if kw.get("auxiliary"):
+        return True
+    return str(kw.get("purpose") or "").strip().lower() in _AUX_PURPOSES
+
+
 def _on_llm_request(**kw):
     if not _on():
         return None
     req = kw.get("request")
     if not isinstance(req, dict):
+        return None
+    if _is_aux_request(kw):
+        # 辅助请求豁免：原样放行，不带 hint、不推进 call_index（RFC §1.3/§3.3.5）。
         return None
     sid = _sid(kw)
     if not sid:
@@ -165,8 +199,6 @@ def _on_llm_request(**kw):
     try:
         call_index, state, since_ms, epoch, resumed = _state.note_call(
             sid, str(kw.get("api_request_id") or ""))
-        if resumed:  # M4：finalize -> running 边，补发 running 事件
-            _sink.emit(_builder.status_event(sid, "running", since_ms=since_ms))
         parent_session_id, derivation = _state.lineage(sid)
         # 一次快照同时喂 prediction 与 TTL 推导，避免重复统计。
         prediction = _stats.snapshot(sid, next_action_map=_settings.next_action_map())
@@ -199,6 +231,10 @@ def _on_llm_request(**kw):
         headers = dict(req.get("extra_headers") or {})
         headers["X-Agent-Hint"] = _codec.encode(hint)
         req["extra_headers"] = headers
+        # resume 只描述这一条请求，发出去之后会话就是 running 了。
+        # （finalize 不会出现在请求头上：它是会话关闭后的事件，关闭后没有新请求。）
+        if state == "resume":
+            _state.set_state(sid, "running")
         return {"request": req}
     except Exception as e:
         _sink._warn_once("llm_request", "hint build failed (kept request as-is): " + str(e))

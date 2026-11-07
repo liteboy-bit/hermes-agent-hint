@@ -10,6 +10,9 @@
 # 为它声明保留等于要求引擎保留一个不存在的东西。
 MIN_CACHEABLE_PREFIX_TOKENS = 128
 
+# 内部状态 → 状态事件词表（简化字段 RFC §3.3.2 / §3.5.2.3）。
+EVENT_STATE = {"tool": "pause", "suspend": "pause", "resume": "running"}
+
 _CJK_RANGES = ((0x2E80, 0x9FFF), (0xF900, 0xFAFF), (0xFF00, 0xFFEF))
 _CHARS_PER_TOKEN = 4
 
@@ -17,7 +20,13 @@ _CHARS_PER_TOKEN = 4
 def request_hint(session_id, call_index, epoch, agent_type, state, state_since_ms,
                  parent_session_id=None, derivation=None,
                  priority=None, cache_control=None, prediction=None):
-    """构造随 LLM 请求下发的完整 AgentHint（缺省项省略）。"""
+    """构造随 LLM 请求下发的完整 AgentHint（缺省项省略）。
+
+    ``agent_status`` 只带 ``state`` 与 ``state_since_ms``：``reason``/``tools`` 是排障细节，
+    不占 header 预算。按简化字段 RFC §3.3.2 折叠表，``tool`` 与 ``suspend`` 在消费侧都是
+    "在等外部事件"（工具返回 / 人等审批），出口一律折成 ``pause``；``resume``（人放行了）
+    是真正需要的边，只在请求头里出现一次。
+    """
     session = {
         "session_id": session_id,
         "agent_type": agent_type,
@@ -28,17 +37,35 @@ def request_hint(session_id, call_index, epoch, agent_type, state, state_since_m
         session["parent_session_id"] = parent_session_id
     if derivation:
         session["derivation"] = derivation
+    wire_state = "pause" if state in ("suspend", "tool") else state
     hint = {
         "session": session,
-        "agent_status": {"state": state, "state_since_ms": state_since_ms},
+        "agent_status": {"state": wire_state, "state_since_ms": state_since_ms},
     }
     if priority:
         hint["priority"] = priority
     if cache_control:
         hint["cache_control"] = cache_control
     if prediction:
-        hint["prediction"] = prediction
+        hint["prediction"] = _fold_next_action(prediction)
     return hint
+
+
+def _fold_next_action(prediction):
+    """把 prediction.next_action.state 折进对外词汇表（tool/suspend → running）。
+
+    `next_action` 由 ``next_action_map`` 配置驱动，配置里可能写 ``tool``；但对外状态只承认
+    running/pause/resume/finalize，所以这里统一折叠，具体要调什么由 ``next_action.tools`` 表达。
+    """
+    action = prediction.get("next_action") if isinstance(prediction, dict) else None
+    if not isinstance(action, dict):
+        return prediction
+    state = action.get("state")
+    if state in ("tool", "suspend"):
+        folded = dict(prediction)
+        folded["next_action"] = {**action, "state": "running"}
+        return folded
+    return prediction
 
 
 def _estimate_tokens(value):
@@ -101,10 +128,15 @@ def cache_control(request, end=1, ttl_s=0, task_end=None):
 
 
 def status_event(session_id, state, since_ms, reason=None, tools=None):
-    """构造状态事件（异步上报）。session 只带 session_id（对齐字段文档 §4 示例）。"""
+    """构造状态事件（异步上报）。session 只带 session_id（对齐字段文档 §4 示例）。
+
+    事件通道词表只有 ``running | pause | finalize``（简化字段 RFC §3.3.2 / §3.5.2.3）：
+    ``tool`` / ``suspend`` 折成 ``pause``，``resume`` 这种一次性边回落成 ``running``。
+    """
     event = {
         "session": {"session_id": session_id},
-        "agent_status": {"state": state, "state_since_ms": since_ms},
+        "agent_status": {"state": EVENT_STATE.get(state, state),
+                         "state_since_ms": since_ms},
     }
     if reason:
         event["agent_status"]["reason"] = reason

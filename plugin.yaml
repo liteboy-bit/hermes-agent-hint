@@ -13,6 +13,7 @@ provides_hooks:
   - on_session_start
   - on_session_end
   - on_session_finalize
+  - pre_api_request
   - pre_tool_call
   - post_tool_call
   - pre_approval_request
@@ -51,11 +52,6 @@ config_schema:
     type: str
     required: false
     description: "Target URL for the http sink (JSON POST). Empty = no network requests at all."
-  finalize_on:
-    type: str
-    required: false
-    description: "When to emit the finalize event: session_end | session_finalize.
-      Default: session_end."
   suspend_after_s:
     required: false
     description: "Emit a suspend event once an approval has been pending this many seconds
